@@ -23,7 +23,6 @@ from mujoco import mjx
 import numpy as np
 
 from mujoco_playground._src import mjx_env
-from mujoco_playground._src import reward
 from mujoco_playground._src.manipulation.leap_hand import base as leap_hand_base
 from mujoco_playground._src.manipulation.leap_hand import leap_hand_constants as consts
 
@@ -54,6 +53,9 @@ def default_config() -> config_dict.ConfigDict:
               action_rate=0.0,
           ),
       ),
+      impl='jax',
+      nconmax=30 * 8192,
+      njmax=128,
   )
 
 
@@ -105,12 +107,15 @@ class CubeRotateZAxis(leap_hand_base.LeapHandEnv):
 
     qpos = jp.concatenate([q_hand, q_cube])
     qvel = jp.concatenate([v_hand, v_cube])
-    data = mjx_env.init(
-        self.mjx_model,
+    data = mjx_env.make_data(
+        self._mj_model,
         qpos=qpos,
         qvel=qvel,
         ctrl=q_hand,
-        mocap_pos=jp.array([-100, -100, -100]),  # Hide goal for this task.
+        mocap_pos=jp.array([-100.0, -100.0, -100.0]),  # Hide goal for task.
+        impl=self._mjx_model.impl.value,
+        nconmax=self._config.nconmax,
+        njmax=self._config.njmax,
     )
 
     info = {
@@ -145,7 +150,7 @@ class CubeRotateZAxis(leap_hand_base.LeapHandEnv):
     rewards = {
         k: v * self._config.reward_config.scales[k] for k, v in rewards.items()
     }
-    reward = sum(rewards.values()) * self.dt
+    reward = sum(rewards.values()) * self.dt  # pylint: disable=redefined-outer-name
 
     state.info["last_last_act"] = state.info["last_act"]
     state.info["last_act"] = action
@@ -261,10 +266,6 @@ class CubeRotateZAxis(leap_hand_base.LeapHandEnv):
   def _cost_pose(self, joint_angles: jax.Array) -> jax.Array:
     return jp.sum(jp.square(joint_angles - self._default_pose))
 
-  @property
-  def observation_size(self) -> mjx_env.ObservationSize:
-    return {"privileged_state": (105,), "state": (32,)}
-
 
 def domain_randomize(model: mjx.Model, rng: jax.Array):
   mj_model = CubeRotateZAxis().mj_model
@@ -296,13 +297,7 @@ def domain_randomize(model: mjx.Model, rng: jax.Array):
 
   @jax.vmap
   def rand(rng):
-    # Cube friction: =U(0.1, 0.5).
     rng, key = jax.random.split(rng)
-    cube_friction = jax.random.uniform(key, (1,), minval=0.1, maxval=0.5)
-    geom_friction = model.geom_friction.at[
-        cube_geom_id : cube_geom_id + 1, 0
-    ].set(cube_friction)
-
     # Fingertip friction: =U(0.5, 1.0).
     fingertip_friction = jax.random.uniform(key, (1,), minval=0.5, maxval=1.0)
     geom_friction = model.geom_friction.at[fingertip_geom_ids, 0].set(
@@ -313,7 +308,6 @@ def domain_randomize(model: mjx.Model, rng: jax.Array):
     rng, key1, key2 = jax.random.split(rng, 3)
     dmass = jax.random.uniform(key1, minval=0.8, maxval=1.2)
     cube_mass = model.body_mass[cube_body_id]
-    body_mass = model.body_mass.at[cube_body_id].set(cube_mass * dmass)
     body_inertia = model.body_inertia.at[cube_body_id].set(
         model.body_inertia[cube_body_id] * dmass
     )

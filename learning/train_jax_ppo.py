@@ -14,18 +14,12 @@
 # ==============================================================================
 """Train a PPO agent using JAX on the specified environment."""
 
-import os
-
-xla_flags = os.environ.get("XLA_FLAGS", "")
-xla_flags += " --xla_gpu_triton_gemm_any=True"
-os.environ["XLA_FLAGS"] = xla_flags
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["MUJOCO_GL"] = "egl"
-
-from datetime import datetime
+import datetime
 import functools
 import json
+import os
 import time
+import warnings
 
 from absl import app
 from absl import flags
@@ -34,29 +28,31 @@ from brax.training.agents.ppo import networks as ppo_networks
 from brax.training.agents.ppo import networks_vision as ppo_networks_vision
 from brax.training.agents.ppo import train as ppo
 from etils import epath
-from flax.training import orbax_utils
 import jax
 import jax.numpy as jp
 import mediapy as media
 from ml_collections import config_dict
-from ml_collections import config_flags
 import mujoco
-from orbax import checkpoint as ocp
-from tensorboardX import SummaryWriter
-import wandb
-
 import mujoco_playground
 from mujoco_playground import registry
 from mujoco_playground import wrapper
 from mujoco_playground.config import dm_control_suite_params
 from mujoco_playground.config import locomotion_params
 from mujoco_playground.config import manipulation_params
+import tensorboardX
+import wandb
+
+
+xla_flags = os.environ.get("XLA_FLAGS", "")
+xla_flags += " --xla_gpu_triton_gemm_any=True"
+os.environ["XLA_FLAGS"] = xla_flags
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["MUJOCO_GL"] = "egl"
 
 # Ignore the info logs from brax
 logging.set_verbosity(logging.WARNING)
 
 # Suppress warnings
-import warnings
 
 # Suppress RuntimeWarnings from JAX
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="jax")
@@ -71,6 +67,7 @@ _ENV_NAME = flags.DEFINE_string(
     "LeapCubeReorient",
     f"Name of the environment. One of {', '.join(registry.ALL_ENVS)}",
 )
+_IMPL = flags.DEFINE_enum("impl", "jax", ["jax", "warp"], "MJX implementation")
 _VISION = flags.DEFINE_boolean("vision", False, "Use vision input")
 _LOAD_CHECKPOINT_PATH = flags.DEFINE_string(
     "load_checkpoint_path", None, "Path to load checkpoint from"
@@ -93,6 +90,9 @@ _DOMAIN_RANDOMIZATION = flags.DEFINE_boolean(
 _SEED = flags.DEFINE_integer("seed", 1, "Random seed")
 _NUM_TIMESTEPS = flags.DEFINE_integer(
     "num_timesteps", 1_000_000, "Number of timesteps"
+)
+_NUM_VIDEOS = flags.DEFINE_integer(
+    "num_videos", 1, "Number of videos to record after training."
 )
 _NUM_EVALS = flags.DEFINE_integer("num_evals", 5, "Number of evaluations")
 _REWARD_SCALING = flags.DEFINE_float("reward_scaling", 0.1, "Reward scaling")
@@ -134,23 +134,68 @@ _POLICY_OBS_KEY = flags.DEFINE_string(
     "policy_obs_key", "state", "Policy obs key"
 )
 _VALUE_OBS_KEY = flags.DEFINE_string("value_obs_key", "state", "Value obs key")
+_RSCOPE_ENVS = flags.DEFINE_integer(
+    "rscope_envs",
+    None,
+    "Number of parallel environment rollouts to save for the rscope viewer",
+)
+_DETERMINISTIC_RSCOPE = flags.DEFINE_boolean(
+    "deterministic_rscope",
+    True,
+    "Run deterministic rollouts for the rscope viewer",
+)
+_RUN_EVALS = flags.DEFINE_boolean(
+    "run_evals",
+    True,
+    "Run evaluation rollouts between policy updates.",
+)
+_LOG_TRAINING_METRICS = flags.DEFINE_boolean(
+    "log_training_metrics",
+    False,
+    "Whether to log training metrics and callback to progress_fn. Significantly"
+    " slows down training if too frequent.",
+)
+_TRAINING_METRICS_STEPS = flags.DEFINE_integer(
+    "training_metrics_steps",
+    1_000_000,
+    "Number of steps between logging training metrics. Increase if training"
+    " experiences slowdown.",
+)
 
 
 def get_rl_config(env_name: str) -> config_dict.ConfigDict:
   if env_name in mujoco_playground.manipulation._envs:
     if _VISION.value:
-      return manipulation_params.brax_vision_ppo_config(env_name)
-    return manipulation_params.brax_ppo_config(env_name)
+      return manipulation_params.brax_vision_ppo_config(env_name, _IMPL.value)
+    return manipulation_params.brax_ppo_config(env_name, _IMPL.value)
   elif env_name in mujoco_playground.locomotion._envs:
-    if _VISION.value:
-      return locomotion_params.brax_vision_ppo_config(env_name)
-    return locomotion_params.brax_ppo_config(env_name)
+    return locomotion_params.brax_ppo_config(env_name, _IMPL.value)
   elif env_name in mujoco_playground.dm_control_suite._envs:
     if _VISION.value:
-      return dm_control_suite_params.brax_vision_ppo_config(env_name)
-    return dm_control_suite_params.brax_ppo_config(env_name)
+      return dm_control_suite_params.brax_vision_ppo_config(
+          env_name, _IMPL.value
+      )
+    return dm_control_suite_params.brax_ppo_config(env_name, _IMPL.value)
 
   raise ValueError(f"Env {env_name} not found in {registry.ALL_ENVS}.")
+
+
+def rscope_fn(full_states, obs, rew, done):
+  """
+  All arrays are of shape (unroll_length, rscope_envs, ...)
+  full_states: dict with keys 'qpos', 'qvel', 'time', 'metrics'
+  obs: nd.array or dict obs based on env configuration
+  rew: nd.array rewards
+  done: nd.array done flags
+  """
+  # Calculate cumulative rewards per episode, stopping at first done flag
+  done_mask = jp.cumsum(done, axis=0)
+  valid_rewards = rew * (done_mask == 0)
+  episode_rewards = jp.sum(valid_rewards, axis=0)
+  print(
+      "Collected rscope rollouts with reward"
+      f" {episode_rewards.mean():.3f} +- {episode_rewards.std():.3f}"
+  )
 
 
 def main(argv):
@@ -160,11 +205,14 @@ def main(argv):
 
   # Load environment configuration
   env_cfg = registry.get_default_config(_ENV_NAME.value)
+  env_cfg["impl"] = _IMPL.value
 
   ppo_params = get_rl_config(_ENV_NAME.value)
 
   if _NUM_TIMESTEPS.present:
     ppo_params.num_timesteps = _NUM_TIMESTEPS.value
+  if _PLAY_ONLY.present:
+    ppo_params.num_timesteps = 0
   if _NUM_EVALS.present:
     ppo_params.num_evals = _NUM_EVALS.value
   if _REWARD_SCALING.present:
@@ -198,28 +246,33 @@ def main(argv):
   if _CLIPPING_EPSILON.present:
     ppo_params.clipping_epsilon = _CLIPPING_EPSILON.value
   if _POLICY_HIDDEN_LAYER_SIZES.present:
-    ppo_params.network_factory.policy_hidden_layer_sizes = tuple(
-        _POLICY_HIDDEN_LAYER_SIZES.value
+    ppo_params.network_factory.policy_hidden_layer_sizes = list(
+        map(int, _POLICY_HIDDEN_LAYER_SIZES.value)
     )
   if _VALUE_HIDDEN_LAYER_SIZES.present:
-    ppo_params.network_factory.value_hidden_layer_sizes = tuple(
-        _VALUE_HIDDEN_LAYER_SIZES.value
+    ppo_params.network_factory.value_hidden_layer_sizes = list(
+        map(int, _VALUE_HIDDEN_LAYER_SIZES.value)
     )
   if _POLICY_OBS_KEY.present:
     ppo_params.network_factory.policy_obs_key = _POLICY_OBS_KEY.value
   if _VALUE_OBS_KEY.present:
     ppo_params.network_factory.value_obs_key = _VALUE_OBS_KEY.value
-
   if _VISION.value:
     env_cfg.vision = True
     env_cfg.vision_config.render_batch_size = ppo_params.num_envs
   env = registry.load(_ENV_NAME.value, config=env_cfg)
+  if _RUN_EVALS.present:
+    ppo_params.run_evals = _RUN_EVALS.value
+  if _LOG_TRAINING_METRICS.present:
+    ppo_params.log_training_metrics = _LOG_TRAINING_METRICS.value
+  if _TRAINING_METRICS_STEPS.present:
+    ppo_params.training_metrics_steps = _TRAINING_METRICS_STEPS.value
 
   print(f"Environment Config:\n{env_cfg}")
   print(f"PPO Training Parameters:\n{ppo_params}")
 
   # Generate unique experiment name
-  now = datetime.now()
+  now = datetime.datetime.now()
   timestamp = now.strftime("%Y%m%d-%H%M%S")
   exp_name = f"{_ENV_NAME.value}-{timestamp}"
   if _SUFFIX.value is not None:
@@ -233,29 +286,27 @@ def main(argv):
 
   # Initialize Weights & Biases if required
   if _USE_WANDB.value and not _PLAY_ONLY.value:
-    wandb.init(project="mjxrl", entity="dextrm", name=exp_name)
+    wandb.init(project="mjxrl", name=exp_name)
     wandb.config.update(env_cfg.to_dict())
     wandb.config.update({"env_name": _ENV_NAME.value})
 
   # Initialize TensorBoard if required
   if _USE_TB.value and not _PLAY_ONLY.value:
-    writer = SummaryWriter(logdir)
+    writer = tensorboardX.SummaryWriter(logdir)
 
   # Handle checkpoint loading
   if _LOAD_CHECKPOINT_PATH.value is not None:
     # Convert to absolute path
-    _LOAD_CHECKPOINT_PATH.value = epath.Path(
-        _LOAD_CHECKPOINT_PATH.value
-    ).resolve()
-    if _LOAD_CHECKPOINT_PATH.value.is_dir():
-      latest_ckpts = list(_LOAD_CHECKPOINT_PATH.value.glob("*"))
+    ckpt_path = epath.Path(_LOAD_CHECKPOINT_PATH.value).resolve()
+    if ckpt_path.is_dir():
+      latest_ckpts = list(ckpt_path.glob("*"))
       latest_ckpts = [ckpt for ckpt in latest_ckpts if ckpt.is_dir()]
       latest_ckpts.sort(key=lambda x: int(x.name))
       latest_ckpt = latest_ckpts[-1]
       restore_checkpoint_path = latest_ckpt
       print(f"Restoring from: {restore_checkpoint_path}")
     else:
-      restore_checkpoint_path = _LOAD_CHECKPOINT_PATH.value
+      restore_checkpoint_path = ckpt_path
       print(f"Restoring from checkpoint: {restore_checkpoint_path}")
   else:
     print("No checkpoint path provided, not restoring from checkpoint")
@@ -267,15 +318,8 @@ def main(argv):
   print(f"Checkpoint path: {ckpt_path}")
 
   # Save environment configuration
-  with open(ckpt_path / "config.json", "w") as fp:
-    json.dump(env_cfg.to_json(), fp, indent=4)
-
-  # Define policy parameters function for saving checkpoints
-  def policy_params_fn(current_step, make_policy, params):
-    orbax_checkpointer = ocp.PyTreeCheckpointer()
-    save_args = orbax_utils.save_args_from_target(params)
-    path = ckpt_path / f"{current_step}"
-    orbax_checkpointer.save(path, params, force=True, save_args=save_args)
+  with open(ckpt_path / "config.json", "w", encoding="utf-8") as fp:
+    json.dump(env_cfg.to_dict(), fp, indent=4)
 
   training_params = dict(ppo_params)
   if "network_factory" in training_params:
@@ -321,9 +365,9 @@ def main(argv):
       ppo.train,
       **training_params,
       network_factory=network_factory,
-      policy_params_fn=policy_params_fn,
       seed=_SEED.value,
       restore_checkpoint_path=restore_checkpoint_path,
+      save_checkpoint_path=ckpt_path,
       wrap_env_fn=None if _VISION.value else wrapper.wrap_for_brax_training,
       num_eval_envs=num_eval_envs,
   )
@@ -343,19 +387,59 @@ def main(argv):
       for key, value in metrics.items():
         writer.add_scalar(key, value, num_steps)
       writer.flush()
+    if _RUN_EVALS.value:
+      print(f"{num_steps}: reward={metrics['eval/episode_reward']:.3f}")
+    if _LOG_TRAINING_METRICS.value:
+      if "episode/sum_reward" in metrics:
+        print(
+            f"{num_steps}: mean episode"
+            f" reward={metrics['episode/sum_reward']:.3f}"
+        )
 
-    print(f"{num_steps}: reward={metrics['eval/episode_reward']:.3f}")
+  # Load evaluation environment.
+  eval_env = None
+  if not _VISION.value:
+    eval_env = registry.load(_ENV_NAME.value, config=env_cfg)
+  num_envs = 1
+  if _VISION.value:
+    num_envs = env_cfg.vision_config.render_batch_size
 
-  # Load evaluation environment
-  eval_env = (
-      None if _VISION.value else registry.load(_ENV_NAME.value, config=env_cfg)
-  )
+  policy_params_fn = lambda *args: None
+  if _RSCOPE_ENVS.value:
+    # Interactive visualisation of policy checkpoints
+    from rscope import brax as rscope_utils
+
+    if not _VISION.value:
+      rscope_env = registry.load(_ENV_NAME.value, config=env_cfg)
+      rscope_env = wrapper.wrap_for_brax_training(
+          rscope_env,
+          episode_length=ppo_params.episode_length,
+          action_repeat=ppo_params.action_repeat,
+          randomization_fn=training_params.get("randomization_fn"),
+      )
+    else:
+      rscope_env = env
+
+    rscope_handle = rscope_utils.BraxRolloutSaver(
+        rscope_env,
+        ppo_params,
+        _VISION.value,
+        _RSCOPE_ENVS.value,
+        _DETERMINISTIC_RSCOPE.value,
+        jax.random.PRNGKey(_SEED.value),
+        rscope_fn,
+    )
+
+    def policy_params_fn(current_step, make_policy, params):  # pylint: disable=unused-argument
+      rscope_handle.set_make_policy(make_policy)
+      rscope_handle.dump_rollout(params)
 
   # Train or load the model
-  make_inference_fn, params, _ = train_fn(
+  make_inference_fn, params, _ = train_fn(  # pylint: disable=no-value-for-parameter
       environment=env,
       progress_fn=progress,
-      eval_env=None if _VISION.value else eval_env,
+      policy_params_fn=policy_params_fn,
+      eval_env=eval_env,
   )
 
   print("Done training.")
@@ -365,60 +449,69 @@ def main(argv):
 
   print("Starting inference...")
 
-  # Create inference function
+  # Create inference function.
   inference_fn = make_inference_fn(params, deterministic=True)
   jit_inference_fn = jax.jit(inference_fn)
 
-  # Prepare for evaluation
-  num_envs = 1
-  if _VISION.value:
-    eval_env = env
-    num_envs = env_cfg.vision_config.render_batch_size
+  # Run evaluation rollouts.
+  def do_rollout(rng, state):
+    empty_data = state.data.__class__(
+        **{k: None for k in state.data.__annotations__}
+    )  # pytype: disable=attribute-error
+    empty_traj = state.__class__(**{k: None for k in state.__annotations__})  # pytype: disable=attribute-error
+    empty_traj = empty_traj.replace(data=empty_data)
 
-  jit_reset = jax.jit(eval_env.reset)
-  jit_step = jax.jit(eval_env.step)
+    def step(carry, _):
+      state, rng = carry
+      rng, act_key = jax.random.split(rng)
+      act = jit_inference_fn(state.obs, act_key)[0]
+      state = eval_env.step(state, act)
+      traj_data = empty_traj.tree_replace({
+          "data.qpos": state.data.qpos,
+          "data.qvel": state.data.qvel,
+          "data.time": state.data.time,
+          "data.ctrl": state.data.ctrl,
+          "data.mocap_pos": state.data.mocap_pos,
+          "data.mocap_quat": state.data.mocap_quat,
+          "data.xfrc_applied": state.data.xfrc_applied,
+      })
+      if _VISION.value:
+        traj_data = jax.tree_util.tree_map(lambda x: x[0], traj_data)
+      return (state, rng), traj_data
 
-  rng = jax.random.PRNGKey(123)
-  rng, reset_rng = jax.random.split(rng)
-  if _VISION.value:
-    reset_rng = jp.asarray(jax.random.split(reset_rng, num_envs))
-  state = jit_reset(reset_rng)
-  state0 = (
-      jax.tree_util.tree_map(lambda x: x[0], state) if _VISION.value else state
-  )
-  rollout = [state0]
-
-  # Run evaluation rollout
-  for i in range(env_cfg.episode_length):
-    act_rng, rng = jax.random.split(rng)
-    ctrl, _ = jit_inference_fn(state.obs, act_rng)
-    state = jit_step(state, ctrl)
-    state0 = (
-        jax.tree_util.tree_map(lambda x: x[0], state)
-        if _VISION.value
-        else state
+    _, traj = jax.lax.scan(
+        step, (state, rng), None, length=_EPISODE_LENGTH.value
     )
-    rollout.append(state0)
-    if state0.done:
-      break
+    return traj
 
-  # Render and save the rollout
+  rng = jax.random.split(jax.random.PRNGKey(_SEED.value), _NUM_VIDEOS.value)
+  reset_states = jax.jit(jax.vmap(eval_env.reset))(rng)
+  if _VISION.value:
+    reset_states = jax.tree_util.tree_map(lambda x: x[0], reset_states)
+  traj_stacked = jax.jit(jax.vmap(do_rollout))(rng, reset_states)
+  trajectories = [None] * _NUM_VIDEOS.value
+  for i in range(_NUM_VIDEOS.value):
+    t = jax.tree.map(lambda x, i=i: x[i], traj_stacked)
+    trajectories[i] = [
+        jax.tree.map(lambda x, j=j: x[j], t)
+        for j in range(_EPISODE_LENGTH.value)
+    ]
+
+  # Render and save the rollout.
   render_every = 2
   fps = 1.0 / eval_env.dt / render_every
   print(f"FPS for rendering: {fps}")
-
-  traj = rollout[::render_every]
-
   scene_option = mujoco.MjvOption()
   scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
   scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
   scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
-
-  frames = eval_env.render(
-      traj, height=480, width=640, scene_option=scene_option
-  )
-  media.write_video("rollout.mp4", frames, fps=fps)
-  print("Rollout video saved as 'rollout.mp4'.")
+  for i, rollout in enumerate(trajectories):
+    traj = rollout[::render_every]
+    frames = eval_env.render(
+        traj, height=480, width=640, scene_option=scene_option
+    )
+    media.write_video(f"rollout{i}.mp4", frames, fps=fps)
+    print(f"Rollout video saved as 'rollout{i}.mp4'.")
 
 
 if __name__ == "__main__":

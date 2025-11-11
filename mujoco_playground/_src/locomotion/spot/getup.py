@@ -56,6 +56,9 @@ def default_config() -> config_dict.ConfigDict:
               action_rate=0.0,
           ),
       ),
+      impl="jax",
+      nconmax=30 * 8192,
+      njmax=12 + 30 * 4,
   )
 
 
@@ -116,9 +119,15 @@ class Getup(spot_base.SpotEnv):
         self._init_q,
     )
 
-    data = mjx_env.init(
-        self.mjx_model, qpos=qpos, qvel=jp.zeros(self.mjx_model.nv)
+    data = mjx_env.make_data(
+        self.mj_model,
+        qpos=qpos,
+        qvel=jp.zeros(self.mjx_model.nv),
+        impl=self.mjx_model.impl.value,
+        nconmax=self._config.nconmax,
+        njmax=self._config.njmax,
     )
+    data = mjx.forward(self.mjx_model, data)
 
     # Settle the robot.
     data = mjx_env.step(self.mjx_model, data, qpos[7:], self._settle_steps)
@@ -277,7 +286,3 @@ class Getup(spot_base.SpotEnv):
     c1 = jp.sum(jp.square(act - info["last_act"]))
     c2 = jp.sum(jp.square(act - 2 * info["last_act"] + info["last_last_act"]))
     return c1 + c2
-
-  @property
-  def observation_size(self) -> mjx_env.ObservationSize:
-    return 30

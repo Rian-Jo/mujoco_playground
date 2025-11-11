@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# pylint: disable=wrong-import-position
 """Train a PPO agent using RSL-RL for the specified environment."""
 
 import os
@@ -28,7 +29,6 @@ from absl import app
 from absl import flags
 from absl import logging
 import jax
-import jax.numpy as jp
 import mediapy as media
 from ml_collections import config_dict
 import mujoco
@@ -131,13 +131,15 @@ def main(argv):
   # Initialize Weights & Biases if required
   if _USE_WANDB.value and not _PLAY_ONLY.value:
     wandb.tensorboard.patch(root_logdir=logdir)
-    wandb.init(project="mjxrl", entity="dextrm", name=exp_name)
+    wandb.init(project="mjxrl", name=exp_name)
     wandb.config.update(env_cfg.to_dict())
     wandb.config.update({"env_name": _ENV_NAME.value})
 
   # Save environment config to JSON
-  with open(os.path.join(ckpt_path, "config.json"), "w") as fp:
-    json.dump(env_cfg.to_json(), fp, indent=4)
+  with open(
+      os.path.join(ckpt_path, "config.json"), "w", encoding="utf-8"
+  ) as fp:
+    json.dump(env_cfg.to_dict(), fp, indent=4)
 
   # Domain randomization
   randomizer = registry.get_domain_randomizer(_ENV_NAME.value)
@@ -146,7 +148,7 @@ def main(argv):
   render_trajectory = []
 
   # Callback to gather states for rendering
-  def render_callback(env, state):
+  def render_callback(_, state):
     render_trajectory.append(state)
 
   # Create the environment
@@ -164,6 +166,12 @@ def main(argv):
 
   # Build RSL-RL config
   train_cfg = get_rl_config(_ENV_NAME.value)
+
+  obs_size = raw_env.observation_size
+  if isinstance(obs_size, dict):
+    train_cfg.obs_groups = {"policy": ["state"], "critic": ["privileged_state"]}
+  else:
+    train_cfg.obs_groups = {"policy": ["state"], "critic": ["state"]}
 
   # Overwrite default config with flags
   train_cfg.seed = _SEED.value
@@ -231,8 +239,11 @@ def main(argv):
   fps = 1.0 / base_env.dt / render_every
   traj = rollout[::render_every]
   frames = eval_env.render(
-      traj, camera=_CAMERA.value, height=480, width=640,
-      scene_option=scene_option
+      traj,
+      camera=_CAMERA.value,
+      height=480,
+      width=640,
+      scene_option=scene_option,
   )
   media.write_video("rollout.mp4", frames, fps=fps)
   print("Rollout video saved as 'rollout.mp4'.")

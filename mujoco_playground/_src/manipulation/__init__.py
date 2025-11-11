@@ -20,6 +20,7 @@ from ml_collections import config_dict
 from mujoco import mjx
 
 from mujoco_playground._src import mjx_env
+from mujoco_playground._src.manipulation.aloha import handover as aloha_handover
 from mujoco_playground._src.manipulation.aloha import single_peg_insertion as aloha_peg
 from mujoco_playground._src.manipulation.franka_emika_panda import open_cabinet as panda_open_cabinet
 from mujoco_playground._src.manipulation.franka_emika_panda import pick as panda_pick
@@ -28,7 +29,9 @@ from mujoco_playground._src.manipulation.franka_emika_panda_robotiq import push_
 from mujoco_playground._src.manipulation.leap_hand import reorient as leap_cube_reorient
 from mujoco_playground._src.manipulation.leap_hand import rotate_z as leap_rotate_z
 
+
 _envs = {
+    "AlohaHandOver": aloha_handover.HandOver,
     "AlohaSinglePegInsertion": aloha_peg.SinglePegInsertion,
     "PandaPickCube": panda_pick.PandaPickCube,
     "PandaPickCubeOrientation": panda_pick.PandaPickCubeOrientation,
@@ -40,6 +43,7 @@ _envs = {
 }
 
 _cfgs = {
+    "AlohaHandOver": aloha_handover.default_config,
     "AlohaSinglePegInsertion": aloha_peg.default_config,
     "PandaPickCube": panda_pick.default_config,
     "PandaPickCubeOrientation": panda_pick.default_config,
@@ -55,7 +59,11 @@ _randomizer = {
     "LeapCubeReorient": leap_cube_reorient.domain_randomize,
 }
 
-ALL = list(_envs.keys())
+
+def __getattr__(name):
+  if name == "ALL_ENVS":
+    return tuple(_envs.keys())
+  raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 def register_environment(
@@ -100,8 +108,11 @@ def load(
   Returns:
       An instance of the environment.
   """
+  mjx_env.ensure_menagerie_exists()  # Ensure menagerie exists when environment is loaded.
   if env_name not in _envs:
-    raise ValueError(f"Env '{env_name}' not found. Available envs: {ALL}")
+    raise ValueError(
+        f"Env '{env_name}' not found. Available envs: {_cfgs.keys()}"
+    )
   config = config or get_default_config(env_name)
   return _envs[env_name](config=config, config_overrides=config_overrides)
 

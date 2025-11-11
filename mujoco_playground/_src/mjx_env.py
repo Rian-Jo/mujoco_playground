@@ -18,6 +18,7 @@ import abc
 import subprocess
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+import warnings
 
 from etils import epath
 from flax import struct
@@ -28,7 +29,6 @@ from mujoco import mjx
 import numpy as np
 import tqdm
 
-
 # Root path is used for loading XML strings directly using etils.epath.
 ROOT_PATH = epath.Path(__file__).parent
 # Base directory for external dependencies.
@@ -37,7 +37,7 @@ EXTERNAL_DEPS_PATH = epath.Path(__file__).parent.parent / "external_deps"
 # Resource paths do not have glob implemented, so we use a bare epath.Path.
 MENAGERIE_PATH = EXTERNAL_DEPS_PATH / "mujoco_menagerie"
 # Commit SHA of the menagerie repo.
-MENAGERIE_COMMIT_SHA = "5e6af47a49bf8ae27581615b54045107b20ce584"
+MENAGERIE_COMMIT_SHA = "14ceccf557cc47240202f2354d684eca58ff8de4"
 
 
 def _clone_with_progress(
@@ -109,9 +109,6 @@ def ensure_menagerie_exists() -> None:
       raise
 
 
-ensure_menagerie_exists()  # Ensure menagerie exists when module is imported.
-
-
 Observation = Union[jax.Array, Mapping[str, jax.Array]]
 ObservationSize = Union[int, Mapping[str, Union[Tuple[int, ...], int]]]
 
@@ -129,17 +126,23 @@ def update_assets(
       update_assets(assets, f, glob, recursive)
 
 
-def init(
-    model: mjx.Model,
+def make_data(
+    model: mujoco.MjModel,
     qpos: Optional[jax.Array] = None,
     qvel: Optional[jax.Array] = None,
     ctrl: Optional[jax.Array] = None,
     act: Optional[jax.Array] = None,
     mocap_pos: Optional[jax.Array] = None,
     mocap_quat: Optional[jax.Array] = None,
+    impl: Optional[str] = None,
+    nconmax: Optional[int] = None,
+    njmax: Optional[int] = None,
+    device: Optional[jax.Device] = None,
 ) -> mjx.Data:
   """Initialize MJX Data."""
-  data = mjx.make_data(model)
+  data = mjx.make_data(
+      model, impl=impl, nconmax=nconmax, njmax=njmax, device=device
+  )
   if qpos is not None:
     data = data.replace(qpos=qpos)
   if qvel is not None:
@@ -149,10 +152,9 @@ def init(
   if act is not None:
     data = data.replace(act=act)
   if mocap_pos is not None:
-    data = data.replace(mocap_pos=mocap_pos.reshape(1, -1))
+    data = data.replace(mocap_pos=mocap_pos.reshape(model.nmocap, -1))
   if mocap_quat is not None:
-    data = data.replace(mocap_quat=mocap_quat.reshape(1, -1))
-  data = mjx.forward(model, data)
+    data = data.replace(mocap_quat=mocap_quat.reshape(model.nmocap, -1))
   return data
 
 
@@ -271,12 +273,21 @@ class MjxEnv(abc.ABC):
 
   @property
   def observation_size(self) -> ObservationSize:
-    rng = jax.random.PRNGKey(0)
-    reset_state = self.unwrapped.reset(rng)
-    obs = reset_state.obs
-    if isinstance(obs, jax.Array):
-      return obs.shape[-1]
-    return jax.tree_util.tree_map(lambda x: x.shape, obs)
+    abstract_state = jax.eval_shape(self.reset, jax.random.PRNGKey(0))
+    obs = abstract_state.obs
+    if isinstance(obs, Mapping):
+      return jax.tree_util.tree_map(lambda x: x.shape, obs)
+    return obs.shape[-1]
+
+  @property
+  def model_assets(self) -> Dict[str, Any]:
+    """Dictionary of model assets to use with MjModel.from_xml_path."""
+    if hasattr(self, "_model_assets"):
+      return self._model_assets
+    raise NotImplementedError(
+        "_model_assets not defined for this environment"
+        "see cartpole.py for an example."
+    )
 
   def render(
       self,
@@ -318,7 +329,7 @@ def render_array(
 ):
   """Renders a trajectory as an array of images."""
   renderer = mujoco.Renderer(mj_model, height=height, width=width)
-  camera = camera or -1
+  camera = camera if camera is not None else -1
 
   if hfield_data is not None:
     mj_model.hfield_data = hfield_data.reshape(mj_model.hfield_data.shape)
@@ -381,7 +392,7 @@ def get_qpos_ids(
   for jnt_name in joint_names:
     jnt = model.joint(jnt_name).id
     jnt_type = model.jnt_type[jnt]
-    qadr = model.jnt_dofadr[jnt]
+    qadr = model.jnt_qposadr[jnt]
     qdim = qpos_width(jnt_type)
     index_list.extend(range(qadr, qadr + qdim))
   return np.array(index_list)

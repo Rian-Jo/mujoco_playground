@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "playground"
-version = "0.0.3"
+version = "0.0.5"
 readme = "README.md"
 authors = [
     {name = "Google DeepMind", email = "mujoco@deepmind.com"},
@@ -23,28 +23,48 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
+    "brax>=0.12.5",
     "etils",
     "flax",
     "jax",
     "lxml",
+    "mediapy",
     "ml_collections",
-    "mujoco-mjx>=3.2.7",
-    "mujoco>=3.2.7",
+    "mujoco-mjx>=3.3.6.dev",
+    "mujoco>=3.3.6.dev",
+    "orbax-checkpoint>=0.11.22",
     "tqdm",
-    "brax>=0.12.1",
 ]
-keywords = ["mjx", "mujoco", "dm_control"]
+keywords = ["mjx", "mujoco", "sim2real", "reinforcement learning"]
+
+[[tool.uv.index]]
+name = "mujoco"
+url = "https://py.mujoco.org"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv.sources]
+mujoco = { index = "mujoco" }
+warp-lang = { index = "nvidia" }
+mujoco-mjx = { git = "https://github.com/google-deepmind/mujoco", rev = "main", subdirectory = "mjx" }
 
 [project.optional-dependencies]
+warp = [
+    "warp-lang>=1.9.0.dev",
+]
 test = [
     "absl-py",
+    "dm_control",
     "pytest",
     "pytest-xdist",
-    "dm_control",
 ]
 notebooks = [
     "matplotlib",
-    "mediapy",
+    "jupyter",
 ]
 dev = [
     "playground[test]",
@@ -56,10 +76,19 @@ dev = [
     "pylint",
     "pytest-xdist",
 ]
+learning = [
+    "rsl-rl-lib>=3.0.0",
+    "wandb",
+]
 all = [
     "playground[dev]",
+    "playground[warp]",
     "playground[notebooks]",
+    "playground[learning]",
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["mujoco_playground"]
@@ -99,11 +128,8 @@ warn_unused_configs = true
 exclude = ["scripts/", "mujoco_menagerie/"]
 
 [tool.pytest.ini_options]
-addopts = [
-    "--ignore=mujoco_menagerie",
-]
 testpaths = [
-    "tests",
+    "mujoco_playground/_src/",
 ]
 
 [tool.isort]
@@ -141,6 +167,9 @@ exclude = [
 ]
 output = ".pytype"
 report_errors = true
+
+[tool.pylint]
+ignore-paths = 'mujoco_playground/experimental/**$'
 
 [tool.hatch.build]
 include = [
