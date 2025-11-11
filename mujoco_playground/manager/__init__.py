@@ -74,6 +74,14 @@ from mujoco_playground.manager.manager_based_env import (
     ManagerBasedConfig,
 )
 
+from mujoco_playground.manager.brax_wrapper import (
+    BraxManagerWrapper,
+    BraxCompatibleState,
+    wrap_for_brax,
+    wrap_for_training,
+    wrap_with_brax_wrappers,
+)
+
 __all__ = [
     # Base
     "ManagerBase",
@@ -115,4 +123,10 @@ __all__ = [
     "ManagerBasedEnv",
     "ManagerBasedState",
     "ManagerBasedConfig",
+    # Brax Integration
+    "BraxManagerWrapper",
+    "BraxCompatibleState",
+    "wrap_for_brax",
+    "wrap_for_training",
+    "wrap_with_brax_wrappers",
 ]

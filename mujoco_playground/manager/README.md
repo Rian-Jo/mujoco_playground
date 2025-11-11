@@ -138,6 +138,123 @@ python learning/train_manager_ppo.py \
     --backend mjx
 ```
 
+## Complete Example: Go2 Velocity Tracking
+
+The Go2 (Unitree quadruped) velocity tracking task provides a complete, ready-to-use example of the manager-based architecture.
+
+### Quick Start with Go2
+
+```python
+from mujoco_playground.manager.configs.go2_velocity import create_go2_velocity_env
+import jax
+import jax.numpy as jnp
+
+# Create environment (flat or rough terrain)
+env = create_go2_velocity_env(task="flat", num_envs=4096, backend="mjx")
+
+# Reset
+rng = jax.random.PRNGKey(0)
+state = env.reset(rng)
+
+# Step
+action = jax.random.uniform(rng, (4096, 12), minval=-1.0, maxval=1.0)
+state = env.step(state, action)
+
+# Access results
+observations = state.info["observations"]  # Dict: {"policy": ..., "privileged": ...}
+reward = state.info["reward"]  # Total reward per env
+done = state.info["done"]  # Termination flags
+command = state.info["command"]  # Current velocity command (vx, vy, wz)
+```
+
+### Training Go2
+
+```bash
+# Flat terrain training
+python learning/train_go2_velocity.py --task flat --num_envs 4096
+
+# Rough terrain with WandB logging
+python learning/train_go2_velocity.py --task rough --num_envs 8192 --use_wandb
+
+# Debug mode (quick test)
+python learning/train_go2_velocity.py --task flat --debug
+
+# Custom hyperparameters
+python learning/train_go2_velocity.py \
+    --task flat \
+    --num_envs 4096 \
+    --learning_rate 1e-4 \
+    --policy_hidden_layers 256,128,64
+```
+
+### Go2 Configuration Highlights
+
+**Observations** (7 terms):
+- Base linear velocity (vx, vy, vz)
+- Base angular velocity (wx, wy, wz)
+- Projected gravity (orientation)
+- Joint positions (12 joints)
+- Joint velocities (12 joints)
+- Last action
+- Current command
+
+**Rewards** (8 weighted terms):
+- Velocity tracking (XY and yaw)
+- Orientation penalty
+- Energy and torque penalties
+- Smoothness rewards
+- Joint velocity penalties
+- Alive bonus
+
+**Commands**:
+- Random velocity targets: vx ∈ [-1.5, 1.5], vy ∈ [-0.8, 0.8], wz ∈ [-1.2, 1.2] m/s
+- Auto-resampling every 10 seconds
+- Curriculum learning: 30% → 100% command range
+
+**Features**:
+- 12-DOF quadruped control
+- 50Hz control, 250Hz simulation
+- Push disturbances for robustness
+- Flat and rough terrain variants
+- Full Brax integration
+
+### Using with Brax Training
+
+```python
+from mujoco_playground.manager.configs.go2_velocity import create_go2_velocity_env
+from mujoco_playground.manager import wrap_for_brax
+from brax.training.agents.ppo import train as train_ppo
+from brax.training.agents.ppo import networks as ppo_networks
+
+# Create and wrap environment
+env = create_go2_velocity_env(task="flat", num_envs=4096)
+brax_env = wrap_for_brax(env, observation_key="policy")
+
+# Setup network
+network_factory = ppo_networks.make_ppo_networks
+
+# Train
+train_fn = train_ppo.train(
+    brax_env,
+    num_timesteps=50_000_000,
+    num_evals=10,
+    episode_length=1000,
+    network_factory=network_factory,
+    num_envs=4096,
+    learning_rate=3e-4,
+)
+```
+
+### Go2 Files
+
+- **Configuration**: `mujoco_playground/manager/configs/go2_velocity.py`
+- **Quadruped Terms**: `mujoco_playground/manager/quadruped_terms.py`
+- **Training Script**: `learning/train_go2_velocity.py`
+- **Demo**: `examples/demo_go2_manager.py`
+- **Documentation**: `mujoco_playground/manager/configs/README.md`
+
+See the [configs README](configs/README.md) for detailed documentation on creating task configurations.
+
 ## Manager Details
 
 ### ObservationManager
